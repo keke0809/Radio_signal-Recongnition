@@ -1,126 +1,136 @@
-import os
-import yaml
-import torch
-import numpy as np
 import sys
-from tqdm import tqdm
+from collections import OrderedDict
+from pathlib import Path
+
+import numpy as np
+import torch
+import yaml
 from torch.utils.data import DataLoader, Subset
+from tqdm import tqdm
 
 from dataloaders.amc_dataset import RadioMLDataset
 from models.cnn_transformer import ConformerAMC
 
-def load_config(config_path='configs/train_config.yaml'):
-    if os.path.exists(config_path):
-        with open(config_path, 'r') as f:
-            return yaml.safe_load(f)
-    else:
-        print(f" 找不到配置文件: {config_path}")
+
+PROJECT_ROOT = Path(__file__).resolve().parent
+
+
+def load_config(config_path="configs/train_config.yaml"):
+    config_full_path = PROJECT_ROOT / config_path
+    if not config_full_path.exists():
+        print(f"Config file not found: {config_full_path}")
         sys.exit(1)
+
+    with config_full_path.open("r") as f:
+        return yaml.safe_load(f)
+
+
+def build_model(config):
+    model_cfg = config["model"]
+    data_cfg = config["data"]
+    return ConformerAMC(
+        num_classes=model_cfg["num_classes"],
+        d_model=model_cfg["d_model"],
+        nhead=model_cfg["nhead"],
+        num_layers=model_cfg["num_layers"],
+        input_channels=model_cfg.get("input_channels", 2),
+        input_length=data_cfg.get("input_length", 1024),
+        dropout=model_cfg.get("dropout", 0.15),
+    )
+
+
+def checkpoint_dir(config):
+    save_dir = config["train"].get("save_dir")
+    if save_dir:
+        return PROJECT_ROOT / save_dir
+
+    experiment_name = config.get("experiment", {}).get("name", "ddp_amc_v2")
+    return PROJECT_ROOT / "checkpoints" / experiment_name
+
+
+def load_model_weights(model, checkpoint_path, device):
+    checkpoint = torch.load(checkpoint_path, map_location=device)
+    state_dict = checkpoint.get("model", checkpoint) if isinstance(checkpoint, dict) else checkpoint
+    cleaned_state_dict = OrderedDict()
+    for key, value in state_dict.items():
+        cleaned_key = key[7:] if key.startswith("module.") else key
+        cleaned_state_dict[cleaned_key] = value
+    model.load_state_dict(cleaned_state_dict)
+    return checkpoint.get("metrics", {}) if isinstance(checkpoint, dict) else {}
+
 
 def test():
     config = load_config()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f" 开始测试，使用设备: {device}")
+    print(f"Testing on device: {device}")
 
-    # ==========================================
-    # 1. 严格加载指定的测试数据 (Validation Indices)
-    # ==========================================
-    print("正在初始化测试集...")
-    test_idx_path = '/home/user/Desktop/zhikeZhang/RadioML/data_splits/val_indices.npy'
-    if not os.path.exists(test_idx_path):
-        print(f" 找不到测试集索引文件: {test_idx_path}")
+    split_dir = PROJECT_ROOT / config["data"].get("split_dir", "data_splits")
+    test_idx_path = split_dir / "val_indices.npy"
+    if not test_idx_path.exists():
+        print(f"Test index file not found: {test_idx_path}")
         return
-        
-    test_idx = np.load(test_idx_path) 
-    full_dataset = RadioMLDataset(config['data']['file_path'])
-    
+
+    test_idx = np.load(test_idx_path)
+    full_dataset = RadioMLDataset(config["data"]["file_path"])
     test_subset = Subset(full_dataset, test_idx)
-    
-    # 推理时不需要求导，显存占用极小，可以把 batch_size 拉到最大 (比如 8192)
-    test_batch_size = config['data']['batch_size'] * 2 if config['data']['batch_size'] <= 4096 else 8192
-    test_loader = DataLoader(test_subset, batch_size=test_batch_size, 
-                             shuffle=False, # 测试集绝对不能打乱，否则无法和原始 SNR 对齐
-                             num_workers=config['data']['num_workers'], 
-                             pin_memory=True)
+    test_loader = DataLoader(
+        test_subset,
+        batch_size=config["data"].get("eval_batch_size", config["data"].get("batch_size", 4096)),
+        shuffle=False,
+        num_workers=config["data"].get("num_workers", 8),
+        pin_memory=torch.cuda.is_available(),
+        persistent_workers=config["data"].get("num_workers", 8) > 0,
+    )
 
-    # ==========================================
-    # 2. 初始化模型架构
-    # ==========================================
-    model = ConformerAMC(
-        num_classes=config['model']['num_classes'],
-        d_model=config['model']['d_model'],
-        nhead=config['model']['nhead'],
-        num_layers=config['model']['num_layers']
-    ).to(device)
-
-    # ==========================================
-    # 3. 鲁棒地加载模型权重
-    # ==========================================
-    checkpoint_path = 'checkpoints/smooth/latest_model.pth' # 读取我们训练脚本最后保存的权重
-    if not os.path.exists(checkpoint_path):
-        print(f" find no weight file: {checkpoint_path}")
+    model = build_model(config).to(device)
+    ckpt_dir = checkpoint_dir(config)
+    checkpoint_path = ckpt_dir / "best_model.pth"
+    if not checkpoint_path.exists():
+        checkpoint_path = ckpt_dir / "latest_model.pth"
+    if not checkpoint_path.exists():
+        print(f"No checkpoint found in: {ckpt_dir}")
         return
-        
-    print(f"loading weight file: {checkpoint_path}...")
-    state_dict = torch.load(checkpoint_path, map_location=device)
-    
-    # 因为我们在 train.py 里处理过 DataParallel，这里直接 load 即可
-    model.load_state_dict(state_dict)
-    
-    # 极其重要：锁定 Dropout 和 BatchNorm
-    model.eval() 
 
-    # ==========================================
-    # 4. 开启极速推理
-    # ==========================================
+    metrics = load_model_weights(model, checkpoint_path, device)
+    print(f"Loaded checkpoint: {checkpoint_path}")
+    if metrics:
+        print(f"Checkpoint metrics: {metrics}")
+    model.eval()
+
     correct = 0
     total = 0
-    
-    # 用于收集画图数据
     all_preds = []
     all_labels = []
     all_snrs = []
+    use_amp = bool(config["train"].get("amp", True)) and device.type == "cuda"
 
-    print("开始前向传播...")
-    # no_grad 彻底关闭计算图，省显存且提速
-    with torch.no_grad(): 
-        pbar = tqdm(test_loader, desc="Testing")
-        for signals, labels, snrs in pbar:
-            signals, labels = signals.to(device), labels.to(device)
-            
-            # 使用 AMP 自动混合精度加速推理
-            with torch.amp.autocast('cuda'):
+    with torch.no_grad():
+        for signals, labels, snrs in tqdm(test_loader, desc="Testing"):
+            signals = signals.to(device, non_blocking=True)
+            labels = labels.to(device, non_blocking=True)
+            with torch.amp.autocast("cuda", enabled=use_amp):
                 outputs = model(signals)
-            
-            _, predicted = outputs.max(1)
-            
+
+            predicted = outputs.argmax(dim=1)
             total += labels.size(0)
             correct += predicted.eq(labels).sum().item()
-
-            # 将结果移回 CPU 并保存
             all_preds.append(predicted.cpu())
             all_labels.append(labels.cpu())
             all_snrs.append(snrs.cpu())
 
-    # ==========================================
-    # 5. 计算指标并保存结果
-    # ==========================================
-    # 拼接所有的 Tensor
-    all_preds_tensor = torch.cat(all_preds)
-    all_labels_tensor = torch.cat(all_labels)
-    all_snrs_tensor = torch.cat(all_snrs)
+    acc = 100.0 * correct / max(total, 1)
+    print("\n" + "=" * 50)
+    print(f"Overall validation/test accuracy: {acc:.2f}%")
+    print("=" * 50 + "\n")
 
-    acc = 100. * correct / total
-    print(f"\n" + "="*50)
-    print(f"🎯 全信噪比域最终测试准确率: {acc:.2f}%")
-    print("="*50 + "\n")
+    experiment_name = config.get("experiment", {}).get("name", "ddp_amc_v2")
+    result_dir = PROJECT_ROOT / "results" / experiment_name
+    result_dir.mkdir(parents=True, exist_ok=True)
+    np.save(result_dir / "test_preds.npy", torch.cat(all_preds).numpy())
+    np.save(result_dir / "test_labels.npy", torch.cat(all_labels).numpy())
+    np.save(result_dir / "test_snrs.npy", torch.cat(all_snrs).numpy())
+    print(f"Prediction arrays saved to: {result_dir}")
 
-    # 将预测结果保存，供 analyze_results.py 画图使用
-    os.makedirs('results', exist_ok=True)
-    np.save('results/smooth/test_preds.npy', all_preds_tensor.numpy())
-    np.save('results/smooth/test_labels.npy', all_labels_tensor.numpy())
-    np.save('results/smooth/test_snrs.npy', all_snrs_tensor.numpy())
-    print(" 预测结果已成功导出至 results/ 目录。")
 
 if __name__ == "__main__":
     test()

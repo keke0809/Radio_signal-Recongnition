@@ -1,98 +1,103 @@
-import os
 import sys
-import yaml
-import torch
-import torch.nn as nn
+from collections import OrderedDict
 from pathlib import Path
 
-
-PROJECT_ROOT = Path(__file__).resolve().parent
-sys.path.insert(0, str(PROJECT_ROOT)) # 把根目录塞进系统路径，解决 models 导入报错
+import torch
+import yaml
 
 from models.cnn_transformer import ConformerAMC
 
-def load_config(config_path='configs/train_config.yaml'):
-    # 将相对路径与根目录拼接
+
+PROJECT_ROOT = Path(__file__).resolve().parent
+
+
+def load_config(config_path="configs/train_config.yaml"):
     config_full_path = PROJECT_ROOT / config_path
-    
-    if config_full_path.exists():
-        with open(config_full_path, 'r') as f:
-            return yaml.safe_load(f)
-    else:
-        print(f" 找不到配置文件: {config_full_path}")
+    if not config_full_path.exists():
+        print(f"Config file not found: {config_full_path}")
         sys.exit(1)
 
+    with config_full_path.open("r") as f:
+        return yaml.safe_load(f)
+
+
+def build_model(config):
+    model_cfg = config["model"]
+    data_cfg = config["data"]
+    return ConformerAMC(
+        num_classes=model_cfg["num_classes"],
+        d_model=model_cfg["d_model"],
+        nhead=model_cfg["nhead"],
+        num_layers=model_cfg["num_layers"],
+        input_channels=model_cfg.get("input_channels", 2),
+        input_length=data_cfg.get("input_length", 1024),
+        dropout=model_cfg.get("dropout", 0.15),
+    )
+
+
+def checkpoint_dir(config):
+    save_dir = config["train"].get("save_dir")
+    if save_dir:
+        return PROJECT_ROOT / save_dir
+
+    experiment_name = config.get("experiment", {}).get("name", "ddp_amc_v2")
+    return PROJECT_ROOT / "checkpoints" / experiment_name
+
+
+def load_model_weights(model, checkpoint_path, device):
+    checkpoint = torch.load(checkpoint_path, map_location=device)
+    state_dict = checkpoint.get("model", checkpoint) if isinstance(checkpoint, dict) else checkpoint
+    cleaned_state_dict = OrderedDict()
+    for key, value in state_dict.items():
+        cleaned_key = key[7:] if key.startswith("module.") else key
+        cleaned_state_dict[cleaned_key] = value
+    model.load_state_dict(cleaned_state_dict)
+
+
 def export_to_onnx():
-    print("="*50)
-    print(" 开始独立导出 ONNX 流程")
-    print("="*50)
-
-    # 1. 加载配置
     config = load_config()
-    
-    device = torch.device("cpu") 
+    device = torch.device("cpu")
+    model = build_model(config).to(device)
 
-    # 2. 初始化模型架构
-    print("正在初始化 Conformer 架构...")
-    model = ConformerAMC(
-        num_classes=config['model']['num_classes'],
-        d_model=config['model']['d_model'],
-        nhead=config['model']['nhead'],
-        num_layers=config['model']['num_layers']
-    ).to(device)
-
-    # 3. 加载中断前保存的最新权重 (使用基于根目录的拼接)
-    checkpoint_path = PROJECT_ROOT / 'checkpoints/smooth/latest_model.pth'
-    
+    ckpt_dir = checkpoint_dir(config)
+    checkpoint_path = ckpt_dir / "best_model.pth"
     if not checkpoint_path.exists():
-        print(f" 导出失败：找不到权重文件 {checkpoint_path}")
+        checkpoint_path = ckpt_dir / "latest_model.pth"
+    if not checkpoint_path.exists():
+        print(f"Export failed: no checkpoint found in {ckpt_dir}")
         return
 
-    print(f"正在加载权重: {checkpoint_path}...")
-    state_dict = torch.load(checkpoint_path, map_location=device)
-    
-    try:
-        model.load_state_dict(state_dict)
-    except RuntimeError as e:
-        print(" 捕获到权重前缀不匹配，尝试自动修复 DataParallel 前缀...")
-        from collections import OrderedDict
-        new_state_dict = OrderedDict()
-        for k, v in state_dict.items():
-            name = k[7:] if k.startswith('module.') else k
-            new_state_dict[name] = v
-        model.load_state_dict(new_state_dict)
-
-    # 导出前必须切换到 eval 模式
+    print(f"Loading checkpoint: {checkpoint_path}")
+    load_model_weights(model, checkpoint_path, device)
     model.eval()
 
-    # 4. 构造 Dummy Input 并导出
-    dummy_input = torch.randn(1, 2, 1024, device=device)
-    onnx_path = PROJECT_ROOT / 'checkpoints/conformer_amc.onnx'
+    dummy_input = torch.randn(
+        1,
+        config["model"].get("input_channels", 2),
+        config["data"].get("input_length", 1024),
+        device=device,
+    )
+    onnx_path = ckpt_dir / "conformer_amc.onnx"
+    onnx_path.parent.mkdir(parents=True, exist_ok=True)
 
-    print("正在执行 ONNX 转换 (包含 Transformer 算子融合)...")
     try:
         torch.onnx.export(
-            model,                      
-            dummy_input,                
-            str(onnx_path),             # export 接收 string 类型的路径
-            export_params=True,         
-            opset_version=14,           
-            do_constant_folding=True,   
-            input_names=['input_signal'], 
-            output_names=['logits'],      
-            dynamic_axes={              
-                'input_signal': {0: 'batch_size'},
-                'logits': {0: 'batch_size'}
-            }
+            model,
+            dummy_input,
+            str(onnx_path),
+            export_params=True,
+            opset_version=config["train"].get("onnx_opset", 14),
+            do_constant_folding=True,
+            input_names=["input_signal"],
+            output_names=["logits"],
+            dynamic_axes={"input_signal": {0: "batch_size"}, "logits": {0: "batch_size"}},
         )
-        print(f" 成功！ONNX 模型已导出至: {onnx_path}")
-        
-        # 获取文件大小
-        file_size_mb = os.path.getsize(onnx_path) / (1024 * 1024)
-        print(f" 模型文件大小: {file_size_mb:.2f} MB")
-        
-    except Exception as e:
-        print(f" 导出 ONNX 失败，捕捉到异常:\n{e}")
+        size_mb = onnx_path.stat().st_size / (1024 * 1024)
+        print(f"ONNX exported to: {onnx_path}")
+        print(f"ONNX size: {size_mb:.2f} MB")
+    except Exception as exc:
+        print(f"ONNX export failed: {exc}")
+
 
 if __name__ == "__main__":
     export_to_onnx()

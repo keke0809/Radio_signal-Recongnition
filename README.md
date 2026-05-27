@@ -1,73 +1,133 @@
+# Conformer-AMC: Automatic Modulation Classification
 
-```markdown
-# Conformer-AMC: Automatic Modulation Classification 📡
-作者：张治柯｜北京交通大学
+作者：张治柯 | 北京交通大学  
 Author: Zhike Zhang | Beijing Jiaotong University
 
-A high-performance deep learning pipeline for Automatic Modulation Classification (AMC) using the RadioML 2018 dataset. This project implements a hybrid **ConformerAMC** architecture that bridges local feature extraction (CNN) with global sequence modeling (Transformer), optimized for extreme noise environments.
+This project trains an automatic modulation classification model on the RadioML 2018 HDF5 dataset. The current pipeline uses a stronger CNN-Conformer style backbone, SNR curriculum learning, validation-driven checkpointing, AMP, and dual-GPU DistributedDataParallel (DDP).
 
-## ✨ Key Features
+## Key Features
 
-* **Hybrid Architecture (Conformer):** Integrates 1D ResNet blocks (for local waveform feature extraction and downsampling) with a Transformer Encoder (`d_model=256`) for long-range temporal dependency modeling.
-* **Curriculum Learning (SNR-based):** Dynamically adjusts the Signal-to-Noise Ratio (SNR) threshold during training (e.g., `15dB` $\rightarrow$ `10dB` $\rightarrow$ `0dB` $\rightarrow$ `-20dB`), allowing the model to learn clean features before tackling extreme noise, effectively preventing gradient shock.
-* **High-Throughput Training:** Fully utilizes multi-GPU acceleration (`nn.DataParallel`), Automatic Mixed Precision (AMP), and large batch sizes for industrial-grade training speed.
-* **Advanced Optimization:** Built with a sophisticated learning rate scheduler (Linear Warmup + Cosine Annealing), Label Smoothing (`0.1`), and Gradient Clipping (`max_norm=1.0`) to ensure stable convergence on heavily corrupted datasets.
-* **Production Ready (ONNX):** Includes an independent script to export the trained PyTorch model to ONNX format. Supports dynamic batch axes (`dynamic_axes`) and operator folding (`opset_version=14`), ready for TensorRT or C++ edge deployment.
+- Strong AMC model: multi-scale 1D CNN stem, residual SE blocks, Conformer-style attention/convolution blocks, and attention pooling.
+- Dual-GPU DDP training: launch with `torchrun --nproc_per_node=2 train_smooth.py`.
+- Config-driven curriculum: SNR thresholds are defined in `configs/train_config.yaml`.
+- Reliable checkpoints: saves `latest_model.pth` every evaluated epoch and `best_model.pth` by validation accuracy.
+- Unified evaluation: `test.py`, `utils/visualize.py`, and `export_onnx.py` read the same experiment/checkpoint settings.
+- Production export: ONNX export keeps dynamic batch axes for deployment.
 
-## 📂 Project Structure
+## Project Structure
 
 ```text
 RadioML/
 ├── configs/
-│   └── train_config.yaml      # Hyperparameters and dataset paths
+│   └── train_config.yaml      # Data, model, training, curriculum, checkpoint config
 ├── dataloaders/
-│   └── amc_dataset.py         # Custom PyTorch Dataset for HDF5 parsing
-├── data_splits/               # Pre-split train/val/test indices (e.g., train_snrs.npy)
+│   └── amc_dataset.py         # HDF5 lazy-loading PyTorch Dataset
+├── dataset/
+│   └── split_data.py          # Generates train/val split indices
 ├── models/
-│   ├── cnn_transformer.py     # ConformerAMC model definition
-│   └── loss.py                # Loss factory (CrossEntropy + Label Smoothing)
+│   ├── cnn_transformer.py     # ConformerAMC model
+│   └── loss.py                # CE / Focal loss factory
+├── tests/
+│   └── test_smoke.py          # Lightweight shape/import tests
 ├── utils/
-│   └── visualize.py           # Evaluation plotting (Confusion Matrix & Acc vs SNR)
-├── train.py                   # Main training loop with curriculum learning
-├── test.py                    # Independent inference and evaluation script
-└── export_onnx.py             # Export model to ONNX format
+│   └── visualize.py           # Confusion matrix and Accuracy-vs-SNR plots
+├── train_smooth.py            # Main DDP training entry
+├── test.py                    # Evaluation on val/test split
+└── export_onnx.py             # Standalone ONNX export
 ```
 
-## 🚀 Quick Start
+## Configuration
 
-### 1. Training
-Configure your parameters in `configs/train_config.yaml`, then start the training pipeline. The script automatically handles SNR-based curriculum stages.
+Edit `configs/train_config.yaml` before running:
+
+- `experiment.name`: controls output folders under `checkpoints/`, `results/`, and `values/`.
+- `data.file_path`: RadioML HDF5 file path.
+- `data.split_dir`: directory containing `train_indices.npy`, `train_snrs.npy`, and `val_indices.npy`.
+- `data.batch_size_per_gpu`: per-process DDP batch size. With two GPUs, the effective batch size is `2 * batch_size_per_gpu`.
+- `model.*`: model width/depth and class count.
+- `curriculum.schedule`: epoch-to-minimum-SNR schedule.
+- `train.save_dir`: checkpoint output directory.
+
+## Quick Start
+
+### 1. Generate Splits
+
 ```bash
-python3 train-one_shot.py
+python dataset/split_data.py
 ```
-*Checkpoints will be automatically saved to the `checkpoints/` directory.*
 
-### 2. Testing & Inference
-Evaluate the trained model on the validation/test set to get the overall accuracy and generate prediction arrays.
+This creates `data_splits/train_indices.npy`, `data_splits/train_snrs.npy`, and `data_splits/val_indices.npy`.
+
+### 2. Train With Two GPUs
+
 ```bash
-python3 test.py
+torchrun --nproc_per_node=2 train_smooth.py
 ```
 
-### 3. Visualization
-Generate a detailed performance report, including a high-order normalized confusion matrix and an Accuracy vs. SNR curve.
+For a single-process smoke run, you can still use:
+
 ```bash
-cd utils
-python3 visualize.py
+python train_smooth.py
 ```
-*Plots will be saved to `values/visualizations/`.*
 
-### 4. Export to ONNX
-Export the trained model to a highly optimized ONNX graph for downstream deployment (e.g., TensorRT).
+Checkpoints are saved to `train.save_dir`, defaulting to `checkpoints/ddp_amc_v2`.
+
+### 3. Evaluate
+
 ```bash
-python3 export_onnx.py
+python test.py
 ```
 
-## 🛠️ Environment & Dependencies
+The script loads `best_model.pth` first, falls back to `latest_model.pth`, and saves arrays to `results/<experiment.name>/`.
 
-* Python 3.8+
-* PyTorch 2.0+ (CUDA enabled)
-* NumPy, h5py, PyYAML, tqdm
-* Matplotlib, Seaborn, scikit-learn (for visualization)
+### 4. Visualize
 
----
+```bash
+python utils/visualize.py
+```
 
+Plots are saved to `values/<experiment.name>/visualizations/`.
+
+### 5. Export ONNX
+
+```bash
+python export_onnx.py
+```
+
+The exported model is saved as `conformer_amc.onnx` in the configured checkpoint directory.
+
+## Tests
+
+Run the lightweight smoke tests:
+
+```bash
+python -m pytest tests/test_smoke.py
+```
+
+These tests verify model forward shape, mini HDF5 dataset loading, and safe import of the DDP training module.
+
+## Repository Hygiene
+
+The repository keeps source code, configuration, tests, and documentation under version control. Large or generated artifacts are ignored by `.gitignore`, including:
+
+- RadioML HDF5 data and generated `data_splits/`
+- checkpoints, ONNX exports, and model weights
+- test predictions under `results/`
+- generated plots/logs under `values/`
+- Python caches and pytest caches
+
+Before committing, check the working tree with:
+
+```bash
+git status --short
+```
+
+Commit only source, config, tests, and docs. Keep trained checkpoints and generated visualizations outside git.
+
+## Dependencies
+
+- Python 3.8+
+- PyTorch 2.0+ with CUDA for DDP training
+- NumPy, h5py, PyYAML, tqdm
+- Matplotlib, Seaborn, scikit-learn
+- pytest for smoke tests

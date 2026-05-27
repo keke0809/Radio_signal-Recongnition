@@ -1,21 +1,60 @@
 # configs/train_config.yaml
 
+experiment:
+  name: "ddp_amc_v2_tuned"
+  seed: 42
+
 data:
   file_path: "/data/zhikeZhang/RadioML/data/GOLD_XYZ_OSC.0001_1024.hdf5"
-  snr_threshold: 0          #  SNR >= 0 
-  train_split: 0.8          # 80% train, 20% val
-  batch_size: 4096          # 
-  num_workers: 8            # DataLoader 的 num_workers 参数
+  split_dir: "data_splits"
+  input_length: 1024
+  snr_threshold: 0
+  train_split: 0.8
+  batch_size: 2048            # Backward-compatible global batch hint.
+  batch_size_per_gpu: 1024    # Two GPUs use an effective batch size of 2048.
+  eval_batch_size: 4096
+  num_workers: 8
 
 model:
-  num_classes: 24   
-  d_model: 256  # Transformer 中的特征维度
-  nhead: 8  # Multi-head attention 的头数
-  num_layers: 5  # Transformer encoder 的层数
+  num_classes: 24
+  input_channels: 2
+  d_model: 256
+  nhead: 8
+  num_layers: 5
+  dropout: 0.2
 
 train:
-  epochs: 50
-  lr: 0.001  # Adam 优化器的初始学习率
-  weight_decay: 0.0001  # Adam 优化器的权重衰减
+  epochs: 80
+  lr: 0.0003
+  min_lr: 0.000001
+  weight_decay: 0.01
+  warmup_epochs: 8
+  grad_clip: 1.0
+  amp: true
+  eval_interval: 1
+  save_dir: "checkpoints/ddp_amc_v2"
+  checkpoint_metric: "val_acc"
+  export_onnx_after_train: true
+  onnx_opset: 14
 
-  save_dir: "checkpoints"   # 权重保存目录
+loss:
+  type: "ce"
+  smoothing: 0.08
+
+curriculum:
+  enabled: true
+  schedule:
+    - epoch: 0
+      min_snr: 8
+    - epoch: 6
+      min_snr: 4
+    - epoch: 16
+      min_snr: 0
+    - epoch: 30
+      min_snr: -4
+    - epoch: 44
+      min_snr: -8
+    - epoch: 58
+      min_snr: -12
+    - epoch: 68
+      min_snr: -20

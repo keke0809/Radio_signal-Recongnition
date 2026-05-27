@@ -37,7 +37,7 @@ class FocalLoss(nn.Module):
 #     else:
 #         raise ValueError(f"不支持的 Loss 类型: {loss_type}")
 
-def build_loss_fn(loss_type='ce', smoothing=0.1):
+def build_loss_fn(loss_type='ce', smoothing=0.1, **kwargs):
     """
     Loss 工厂函数
     smoothing: 标签平滑系数，0.1 代表 90% 留给真实类别，10% 均摊给其余类别
@@ -46,7 +46,6 @@ def build_loss_fn(loss_type='ce', smoothing=0.1):
         # PyTorch 原生支持的高效标签平滑
         return nn.CrossEntropyLoss(label_smoothing=smoothing)
     elif loss_type.lower() == 'focal':
-        # 如果你之前写了 Focal Loss，可以在这里保留
-        pass 
+        return FocalLoss(**kwargs)
     else:
         raise ValueError(f"不支持的 Loss 类型: {loss_type}")
